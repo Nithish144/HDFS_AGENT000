@@ -110,6 +110,12 @@ class HadoopAgent:
                     logger.info("✅ GOAL STATE ACHIEVED (stale log errors ignored).")
                     return {"status": "success", "iterations": iteration, "log": self.action_log}
 
+            # 3b. namenode_formatted=false while NameNode is running is now impossible —
+            # executor.py _format_namenode sets dfs.namenode.name.dir in hdfs-site.xml
+            # BEFORE formatting, and _configure_hdfs_site never touches that property.
+            # So state_detector always reads the same path that was formatted.
+            # No workaround needed here.
+
             # 4. Success check
             if not gaps:
                 logger.info("✅ GOAL STATE ACHIEVED.")
