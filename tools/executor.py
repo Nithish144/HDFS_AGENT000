@@ -288,23 +288,47 @@ class ToolExecutor:
     def _configure_hdfs_site(self, args: dict) -> dict:
         replication = str(args["replication_factor"])
         filepath    = os.path.join(self._hh(), "etc", "hadoop", "hdfs-site.xml")
-        self._update_xml_property(filepath, "dfs.replication",           replication)
-        self._update_xml_property(filepath, "dfs.namenode.name.dir",     "file:///data/namenode")
-        self._update_xml_property(filepath, "dfs.datanode.data.dir",     "file:///data/datanode")
-        os.makedirs("/data/namenode", exist_ok=True)
-        os.makedirs("/data/datanode", exist_ok=True)
+
+        # CRITICAL: NEVER touch dfs.namenode.name.dir or dfs.datanode.data.dir here.
+        # Those dirs are set by _format_namenode BEFORE format runs, so they are
+        # always consistent with the actual formatted location.
+        # If we change namenode dir here (after cluster is running), state_detector
+        # reads the new path, finds no current/ folder → namenode_formatted=False
+        # → agent loops forever trying to reformat a running cluster.
+        # This method is ONLY responsible for replication factor.
+        self._update_xml_property(filepath, "dfs.replication", replication)
+
+        logger.info(f"configure_hdfs_site: replication={replication} (namenode/datanode dirs untouched)")
         return {"updated": filepath, "replication_factor": replication}
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
 
     def _format_namenode(self, args: dict) -> dict:
+        """
+        Sets up /data/namenode and /data/datanode in hdfs-site.xml FIRST,
+        then runs hdfs namenode -format -force.
+        This ensures state_detector always reads the same path that was formatted.
+        """
         hadoop_home = self._hh()
         java_home   = _resolve_java_home()
-        env         = os.environ.copy()
+        filepath    = os.path.join(hadoop_home, "etc", "hadoop", "hdfs-site.xml")
+
+        # Set namenode/datanode dirs in hdfs-site.xml BEFORE formatting.
+        # configure_hdfs_site will never change these — they stay consistent forever.
+        nn_dir = "/data/namenode"
+        dn_dir = "/data/datanode"
+        os.makedirs(nn_dir, exist_ok=True)
+        os.makedirs(dn_dir, exist_ok=True)
+        self._update_xml_property(filepath, "dfs.namenode.name.dir", f"file://{nn_dir}")
+        self._update_xml_property(filepath, "dfs.datanode.data.dir", f"file://{dn_dir}")
+        logger.info(f"format_namenode: set nn_dir={nn_dir} dn_dir={dn_dir} in hdfs-site.xml")
+
+        env = os.environ.copy()
         env["JAVA_HOME"] = java_home
         result = subprocess.run(
             [os.path.join(hadoop_home, "bin", "hdfs"), "namenode", "-format", "-force"],
             capture_output=True, text=True, timeout=60, env=env)
+        logger.info(f"format_namenode: returncode={result.returncode}")
         return {"returncode": result.returncode,
                 "stdout": result.stdout.strip(), "stderr": result.stderr.strip()}
 
@@ -489,18 +513,72 @@ class ToolExecutor:
         return self._run([hdfs, "dfsadmin", "-report"], 30)
 
     def _analyze_logs(self, args: dict) -> dict:
+        """
+        Scan Hadoop logs for ERROR/FATAL lines.
+
+        KEY BEHAVIOUR: If NameNode is currently running, we record its process
+        start-time and only report errors that appear AFTER that moment.
+        Errors from previous failed start attempts are stale and must not block
+        the agent from declaring success.
+
+        If NameNode is NOT running, all errors in the last 100 lines are reported
+        so the agent can diagnose startup failures.
+        """
+        import datetime
+
         log_dir = os.path.join(self._hh(), "logs")
         errors  = []
+
+        # --- determine NameNode start time (None → not running) ---
+        nn_start_time = None
+        try:
+            # "ps -eo lstart,args" gives human-readable start time for every process
+            ps = subprocess.run(
+                ["ps", "-eo", "lstart,args"],
+                capture_output=True, text=True, timeout=5
+            )
+            for line in ps.stdout.splitlines():
+                if "org.apache.hadoop.hdfs.server.namenode.NameNode" in line and "SecondaryNameNode" not in line:
+                    # lstart format: "Thu Mar  6 15:24:00 2026  java ..."
+                    parts = line.strip().split()
+                    # parts[0..4] = day-of-week month day HH:MM:SS year
+                    try:
+                        ts_str = " ".join(parts[1:5])          # "Mar  6 15:24:00 2026"
+                        nn_start_time = datetime.datetime.strptime(ts_str, "%b %d %H:%M:%S %Y")
+                    except Exception:
+                        pass
+                    break
+        except Exception:
+            pass
+
+        # --- scan logs ---
         if os.path.isdir(log_dir):
             for fname in os.listdir(log_dir):
                 if not fname.endswith(".log"):
                     continue
                 try:
-                    for line in open(os.path.join(log_dir, fname), errors="ignore").readlines()[-100:]:
-                        if "ERROR" in line or "FATAL" in line:
-                            errors.append({"file": fname, "line": line.strip()})
+                    for line in open(os.path.join(log_dir, fname), errors="ignore").readlines()[-200:]:
+                        if "ERROR" not in line and "FATAL" not in line:
+                            continue
+                        # If NameNode is running, filter out errors before its start time
+                        if nn_start_time is not None:
+                            try:
+                                # Hadoop log timestamp: "2026-03-06 15:24:01,234"
+                                ts_part = line[:23]
+                                log_time = datetime.datetime.strptime(ts_part, "%Y-%m-%d %H:%M:%S,%f")
+                                if log_time < nn_start_time:
+                                    continue   # stale — skip
+                            except Exception:
+                                pass           # can't parse timestamp → include to be safe
+                        errors.append({"file": fname, "line": line.strip()})
                 except Exception:
                     pass
+
+        stale_note = (
+            f" (filtered errors before NameNode start {nn_start_time.strftime('%H:%M:%S')})"
+            if nn_start_time else ""
+        )
+        logger.info(f"analyze_logs: errors_found={len(errors)}{stale_note}")
         return {"errors_found": len(errors), "errors": errors[:20]}
 
     def _check_disk_space(self, args: dict) -> dict:
